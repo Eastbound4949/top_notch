@@ -1,12 +1,18 @@
 package com.topnotch.overlay
 
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.AudioManager
 import android.os.Build
+import android.provider.MediaStore
 import android.provider.Settings
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -18,9 +24,10 @@ class TopNotchOverlayModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
     companion object {
-        const val NAME                    = "TopNotchOverlay"
-        const val EVENT_PROGRESS          = "TopNotch_DownloadProgress"
+        const val NAME                      = "TopNotchOverlay"
+        const val EVENT_PROGRESS            = "TopNotch_DownloadProgress"
         const val EVENT_NOTIFICATION_ACTION = "TopNotch_NotificationAction"
+        const val EVENT_GESTURE             = "TopNotch_Gesture"
     }
 
     private val wm: WindowManager by lazy {
@@ -31,6 +38,9 @@ class TopNotchOverlayModule(reactContext: ReactApplicationContext) :
     private var cfgColor:     Int     = Color.parseColor("#7c5cbf")
     private var cfgThickness: Float   = 6f
     private var cfgGlow:      Boolean = false
+    private var cfgRounded:   Boolean = true
+    private var torchState:   Boolean = false
+    private var linearView:   LinearProgressView? = null
 
     init {
         DownloadEventBus.onProgress = { jobId, pct, downloaded, total, speed, status ->
@@ -56,7 +66,7 @@ class TopNotchOverlayModule(reactContext: ReactApplicationContext) :
     override fun onCatalystInstanceDestroy() {
         DownloadEventBus.onProgress          = null
         DownloadEventBus.onNotificationAction = null
-        UiThreadUtil.runOnUiThread { removeOverlay() }
+        UiThreadUtil.runOnUiThread { removeOverlay(); removeLinearOverlay() }
     }
 
     // ── Permissions ───────────────────────────────────────────────────────────
@@ -89,7 +99,7 @@ class TopNotchOverlayModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun requestNotificationPermission(promise: Promise) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) { promise.resolve(true); return }
-        val activity = currentActivity ?: run { promise.resolve(false); return }
+        val activity = reactApplicationContext.currentActivity ?: run { promise.resolve(false); return }
         ActivityCompat.requestPermissions(
             activity,
             arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
@@ -117,6 +127,26 @@ class TopNotchOverlayModule(reactContext: ReactApplicationContext) :
         UiThreadUtil.runOnUiThread { removeOverlay() }
     }
 
+    // ── Linear overlay ────────────────────────────────────────────────────────
+
+    @ReactMethod
+    fun showLinearOverlay(progress: Float, colorHex: String) {
+        if (!Settings.canDrawOverlays(reactApplicationContext)) return
+        val color = try { Color.parseColor(colorHex) } catch (_: Exception) { cfgColor }
+        UiThreadUtil.runOnUiThread {
+            if (linearView == null) addLinearOverlay()
+            linearView?.progress    = progress
+            linearView?.accentColor = color
+            linearView?.glowEnabled = cfgGlow
+            linearView?.rounded     = cfgRounded
+        }
+    }
+
+    @ReactMethod
+    fun hideLinearOverlay() {
+        UiThreadUtil.runOnUiThread { removeLinearOverlay() }
+    }
+
     // ── Download control ──────────────────────────────────────────────────────
 
     @ReactMethod
@@ -134,14 +164,9 @@ class TopNotchOverlayModule(reactContext: ReactApplicationContext) :
             reactApplicationContext.startService(intent)
     }
 
-    @ReactMethod
-    fun pauseDownload(jobId: String) = startServiceAction(DownloadOverlayService.ACTION_PAUSE, jobId)
-
-    @ReactMethod
-    fun resumeDownload(jobId: String) = startServiceAction(DownloadOverlayService.ACTION_RESUME, jobId)
-
-    @ReactMethod
-    fun cancelDownload(jobId: String) = startServiceAction(DownloadOverlayService.ACTION_CANCEL, jobId)
+    @ReactMethod fun pauseDownload(jobId: String)  = startServiceAction(DownloadOverlayService.ACTION_PAUSE,  jobId)
+    @ReactMethod fun resumeDownload(jobId: String) = startServiceAction(DownloadOverlayService.ACTION_RESUME, jobId)
+    @ReactMethod fun cancelDownload(jobId: String) = startServiceAction(DownloadOverlayService.ACTION_CANCEL, jobId)
 
     // ── Config ────────────────────────────────────────────────────────────────
 
@@ -152,16 +177,95 @@ class TopNotchOverlayModule(reactContext: ReactApplicationContext) :
             cfg.optString("accentColor").takeIf { it.isNotEmpty() }
                 ?.let { try { cfgColor = Color.parseColor(it) } catch (_: Exception) {} }
             cfgThickness = cfg.optDouble("ringThickness", cfgThickness.toDouble()).toFloat()
-            cfgGlow      = cfg.optBoolean("glow", cfgGlow)
+            cfgGlow      = cfg.optBoolean("glow",    cfgGlow)
+            cfgRounded   = cfg.optBoolean("rounded", cfgRounded)
             UiThreadUtil.runOnUiThread {
-                ringView?.accentColor  = cfgColor
-                ringView?.strokeWidth  = cfgThickness
-                ringView?.glowEnabled  = cfgGlow
+                ringView?.accentColor = cfgColor
+                ringView?.strokeWidth = cfgThickness
+                ringView?.glowEnabled = cfgGlow
+                linearView?.accentColor = cfgColor
+                linearView?.glowEnabled = cfgGlow
+                linearView?.rounded     = cfgRounded
             }
         } catch (_: Exception) {}
     }
 
-    // Legacy stubs kept for JS compatibility
+    // ── Gesture actions ───────────────────────────────────────────────────────
+
+    @ReactMethod
+    fun toggleFlashlight(promise: Promise) {
+        val hasCam = ContextCompat.checkSelfPermission(
+            reactApplicationContext, android.Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (!hasCam) {
+            val activity = reactApplicationContext.currentActivity
+            if (activity != null) {
+                ActivityCompat.requestPermissions(
+                    activity, arrayOf(android.Manifest.permission.CAMERA), 1002
+                )
+            }
+            promise.resolve(false)
+            return
+        }
+
+        try {
+            val cm = reactApplicationContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val cameraId = cm.cameraIdList.firstOrNull {
+                cm.getCameraCharacteristics(it)
+                    .get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            }
+            if (cameraId == null) { promise.resolve(false); return }
+            torchState = !torchState
+            cm.setTorchMode(cameraId, torchState)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            torchState = false
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun dispatchMediaKey(action: String, promise: Promise) {
+        val keyCode = when (action) {
+            "play_pause" -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+            "next"       -> KeyEvent.KEYCODE_MEDIA_NEXT
+            "prev"       -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+            else         -> { promise.resolve(false); return }
+        }
+        try {
+            val am = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun openCameraApp(promise: Promise) {
+        try {
+            val intent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            reactApplicationContext.startActivity(intent)
+            promise.resolve(true)
+        } catch (_: Exception) {
+            try {
+                val fallback = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                reactApplicationContext.startActivity(fallback)
+                promise.resolve(true)
+            } catch (e: Exception) {
+                promise.resolve(false)
+            }
+        }
+    }
+
+    // ── Stubs kept for JS bridge compat ───────────────────────────────────────
+
     @ReactMethod fun startForegroundService(jobId: String, jobName: String, totalBytes: Double) {}
     @ReactMethod fun stopForegroundService(jobId: String)  { hideCameraOverlay() }
     @ReactMethod fun updateProgress(jobId: String, percent: Int, downloadedBytes: Double,
@@ -181,8 +285,8 @@ class TopNotchOverlayModule(reactContext: ReactApplicationContext) :
             sizePx, sizePx,
             cx - sizePx / 2, cy - sizePx / 2,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            // FLAG_NOT_TOUCHABLE removed so gesture detection works
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
@@ -192,6 +296,11 @@ class TopNotchOverlayModule(reactContext: ReactApplicationContext) :
             accentColor = cfgColor
             strokeWidth = cfgThickness
             glowEnabled = cfgGlow
+            onGesture = { gestureType ->
+                sendEvent(EVENT_GESTURE, Arguments.createMap().apply {
+                    putString("gestureType", gestureType)
+                })
+            }
         }
         try { wm.addView(v, params); ringView = v } catch (_: Exception) {}
     }
@@ -199,6 +308,36 @@ class TopNotchOverlayModule(reactContext: ReactApplicationContext) :
     private fun removeOverlay() {
         ringView?.let { try { wm.removeView(it) } catch (_: Exception) {} }
         ringView = null
+    }
+
+    private fun addLinearOverlay() {
+        if (linearView != null) return
+        val density = reactApplicationContext.resources.displayMetrics.density
+        val heightPx = (4 * density).toInt()
+        val widthPx  = reactApplicationContext.resources.displayMetrics.widthPixels
+
+        val params = WindowManager.LayoutParams(
+            widthPx, heightPx,
+            0, 0,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+
+        val v = LinearProgressView(reactApplicationContext).apply {
+            accentColor = cfgColor
+            glowEnabled = cfgGlow
+            rounded     = cfgRounded
+        }
+        try { wm.addView(v, params); linearView = v } catch (_: Exception) {}
+    }
+
+    private fun removeLinearOverlay() {
+        linearView?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        linearView = null
     }
 
     private fun getCameraCenter(): Pair<Int, Int> {

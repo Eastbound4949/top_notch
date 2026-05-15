@@ -17,6 +17,10 @@ export interface NotificationActionEvent {
   action: 'pause' | 'cancel' | 'resume';
 }
 
+export interface GestureEvent {
+  gestureType: 'single' | 'long' | 'double' | 'swipeRL' | 'swipeLR';
+}
+
 class OverlayServiceBridge {
   private emitter: NativeEventEmitter | null = null;
 
@@ -26,7 +30,7 @@ class OverlayServiceBridge {
     }
   }
 
-  // ── Permissions ─────────────────────────────────────────────────────────────
+  // ── Permissions ──────────────────────────────────────────────────────────────
 
   async hasOverlayPermission(): Promise<boolean> {
     if (Platform.OS !== 'android' || !TopNotchOverlay) return false;
@@ -60,9 +64,43 @@ class OverlayServiceBridge {
     TopNotchOverlay.hideCameraOverlay();
   }
 
+  showLinearOverlay(progress: number, color: string = '#7c5cbf'): void {
+    if (Platform.OS !== 'android' || !TopNotchOverlay) return;
+    TopNotchOverlay.showLinearOverlay(progress, color);
+  }
+
+  hideLinearOverlay(): void {
+    if (Platform.OS !== 'android' || !TopNotchOverlay) return;
+    TopNotchOverlay.hideLinearOverlay();
+  }
+
   applyConfig(config: OverlayConfig & { glow?: boolean; matchColor?: boolean; blackBg?: boolean; rounded?: boolean }): void {
     if (Platform.OS !== 'android' || !TopNotchOverlay) return;
     TopNotchOverlay.applyConfig(JSON.stringify(config));
+  }
+
+  // ── Foreground service / notification ────────────────────────────────────────
+
+  startForegroundService(jobId: string, jobName: string, totalBytes: number): void {
+    if (Platform.OS !== 'android' || !TopNotchOverlay) return;
+    TopNotchOverlay.startForegroundService(jobId, jobName, totalBytes);
+  }
+
+  updateProgress(progress: DownloadProgress): void {
+    if (Platform.OS !== 'android' || !TopNotchOverlay) return;
+    TopNotchOverlay.updateProgress(
+      progress.jobId,
+      progress.percent,
+      progress.downloadedBytes,
+      progress.totalBytes,
+      progress.speed,
+      String(progress.status),
+    );
+  }
+
+  stopForegroundService(jobId: string): void {
+    if (Platform.OS !== 'android' || !TopNotchOverlay) return;
+    TopNotchOverlay.stopForegroundService(jobId);
   }
 
   // ── Download control ─────────────────────────────────────────────────────────
@@ -87,6 +125,23 @@ class OverlayServiceBridge {
     TopNotchOverlay.cancelDownload(jobId);
   }
 
+  // ── Gesture actions ──────────────────────────────────────────────────────────
+
+  async toggleFlashlight(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !TopNotchOverlay) return false;
+    return TopNotchOverlay.toggleFlashlight();
+  }
+
+  async dispatchMediaKey(action: 'play_pause' | 'next' | 'prev'): Promise<boolean> {
+    if (Platform.OS !== 'android' || !TopNotchOverlay) return false;
+    return TopNotchOverlay.dispatchMediaKey(action);
+  }
+
+  async openCameraApp(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !TopNotchOverlay) return false;
+    return TopNotchOverlay.openCameraApp();
+  }
+
   // ── Event listeners ──────────────────────────────────────────────────────────
 
   onDownloadProgress(callback: (event: ProgressEvent) => void): () => void {
@@ -101,11 +156,11 @@ class OverlayServiceBridge {
     return () => sub.remove();
   }
 
-  // ── Legacy stubs (kept for backward compat) ──────────────────────────────────
-
-  startForegroundService(jobId: string, jobName: string, totalBytes: number): void {}
-  stopForegroundService(jobId: string): void {}
-  updateProgress(progress: DownloadProgress): void {}
+  onGesture(callback: (event: GestureEvent) => void): () => void {
+    if (!this.emitter) return () => {};
+    const sub = this.emitter.addListener('TopNotch_Gesture', callback);
+    return () => sub.remove();
+  }
 }
 
 export const overlayBridge = new OverlayServiceBridge();

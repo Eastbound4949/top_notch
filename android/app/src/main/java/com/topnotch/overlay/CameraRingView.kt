@@ -2,9 +2,50 @@ package com.topnotch.overlay
 
 import android.content.Context
 import android.graphics.*
+import android.view.GestureDetector
+import android.view.MotionEvent
 import android.view.View
+import kotlin.math.abs
 
 class CameraRingView(context: Context) : View(context) {
+
+    var onGesture: ((String) -> Unit)? = null
+
+    private val gestureDetector = GestureDetector(context,
+        object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                onGesture?.invoke("single")
+                return true
+            }
+            override fun onLongPress(e: MotionEvent) {
+                onGesture?.invoke("long")
+            }
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                onGesture?.invoke("double")
+                return true
+            }
+            override fun onFling(
+                e1: MotionEvent?,
+                e2: MotionEvent,
+                velocityX: Float,
+                velocityY: Float,
+            ): Boolean {
+                val dx = e2.x - (e1?.x ?: 0f)
+                if (abs(dx) > 80 && abs(velocityX) > 150) {
+                    onGesture?.invoke(if (dx < 0) "swipeRL" else "swipeLR")
+                    return true
+                }
+                return false
+            }
+        }
+    )
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        gestureDetector.onTouchEvent(event)
+        return true
+    }
+
+    // ── Drawing ───────────────────────────────────────────────────────────────
 
     private val progressPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
